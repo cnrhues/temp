@@ -31,10 +31,11 @@ WINDOWS = {                       # capture-date basis (all the CSVs support)
 TTC_SITES = ["trafalgar", "contiki", "insight", "insight vacations", "costsaver",
              "luxury gold", "brendan", "brendan vacations", "african travel",
              "uniworld", "red carnation", "at&ro", "ttc"]
-EXCLUDE_SITES = ["viking"]        # river cruise — not comparable to coach tours
+EXCLUDE_SITES = ["viking", "avalon"]   # river cruise — not comparable to coach tours
 
 TWIN_RE = re.compile(r"twin|double|dbl|share", re.I)   # twin-share room types
 MIN_ROWS = 30                     # per group, per window; below this = thin
+MIN_SITE_ROWS = 10                # a site needs this many prices to count in a country
 TOP_N = 12                        # countries on the chart
 COUNTRY_COL = "TOUR_COUNTRY_FIRST"   # fallback to TOUR_COUNTRY if absent
 
@@ -116,10 +117,15 @@ print(f"\n  rows in the two windows: {len(cw):,}")
 print(cw.groupby(["WINDOW", "GROUP"]).size().to_string())
 
 # ==================================================== 2. PRICE INDEX =======
-med = (cw.groupby([COUNTRY_COL, "WINDOW", "GROUP"])
-       .agg(ppn=("PPN", "median"), n=("PPN", "size")).reset_index())
+# Median per SITE first, then median across sites, so one high-volume operator
+# can't define "the market". G Adventures + Intrepid are ~90% of scraped rows.
+per_site = (cw.groupby([COUNTRY_COL, "WINDOW", "GROUP", "SITE"])
+            .agg(ppn=("PPN", "median"), n=("PPN", "size")).reset_index())
+per_site = per_site[per_site.n >= MIN_SITE_ROWS]
+med = (per_site.groupby([COUNTRY_COL, "WINDOW", "GROUP"])
+       .agg(ppn=("ppn", "median"), n=("n", "sum"), sites=("SITE", "nunique")).reset_index())
 wide = med.pivot_table(index=[COUNTRY_COL, "WINDOW"], columns="GROUP",
-                       values=["ppn", "n"]).reset_index()
+                       values=["ppn", "n", "sites"]).reset_index()
 wide.columns = [a if not b else f"{a}_{b}" for a, b in wide.columns]
 wide = wide.rename(columns={COUNTRY_COL: "country"})
 wide = wide.dropna(subset=["ppn_TTC", "ppn_Competitor"])
@@ -128,7 +134,8 @@ wide["thin"] = (wide.n_TTC < MIN_ROWS) | (wide.n_Competitor < MIN_ROWS)
 
 idx = wide.pivot(index="country", columns="WINDOW", values="price_index")
 idx = idx.reindex(columns=list(WINDOWS)).dropna()
-counts = wide.groupby("country")[["n_TTC", "n_Competitor"]].min()
+ccols = [c for c in ["n_TTC", "n_Competitor", "sites_TTC", "sites_Competitor"] if c in wide.columns]
+counts = wide.groupby("country")[ccols].min()
 idx["change_pts"] = idx[list(WINDOWS)[1]] - idx[list(WINDOWS)[0]]
 idx = idx.join(counts).join(wide.groupby("country").thin.any())
 
@@ -173,7 +180,7 @@ idx = idx.sort_values("rank_by", ascending=False)
 top = idx.head(TOP_N).sort_values("change_pts")
 
 print(f"\n=== PRICE INDEX by country (100 = parity), top {TOP_N} by {basis} ===")
-show = [c for c in [*WINDOWS, "change_pts", "n_TTC", "n_Competitor", "thin", "revenue"] if c in top.columns]
+show = [c for c in [*WINDOWS, "change_pts", "sites_Competitor", "n_TTC", "n_Competitor", "thin", "revenue"] if c in top.columns]
 print(top[show].round(1).to_string())
 
 # ============================================================ 4. CHART =====
@@ -221,6 +228,7 @@ print(f"\nwrote {OUT_PNG}")
 
 with pd.ExcelWriter(OUT_XLSX, engine="openpyxl") as xw:
     top[show].round(2).to_excel(xw, sheet_name="summary")
+    per_site.round(2).to_excel(xw, sheet_name="by_site", index=False)
     idx[show].round(2).to_excel(xw, sheet_name="all_countries")
     wide.round(2).to_excel(xw, sheet_name="detail", index=False)
 print(f"wrote {OUT_XLSX}")
