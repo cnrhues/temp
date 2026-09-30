@@ -1,17 +1,36 @@
-SELECT
-    DATE_TRUNC('week', ORIGINAL_BOOKINGDATE_LOCAL)::DATE AS book_week,
-    IFF(COALESCE(ARRAY_TO_STRING(PROMOTION_CODES, ','), '')
-            ILIKE ANY ('%BF2%', '%BLACKFRIDAY%', '%EARLYACCESS%'),
-        'Black Friday code', 'No BF code')              AS promo_group,
-    SUM(IFF(NET_MOVEMENT_TYPE = 'Option', PAX, 0))       AS new_holds,
-    SUM(PAX)                                             AS net_pax,
-    ROUND(1 - SUM(PAX) / NULLIF(SUM(IFF(NET_MOVEMENT_TYPE = 'Option', PAX, 0)), 0), 3)
-                                                         AS share_lost_to_cancellation,
-    ROUND(AVG(IFF(NET_MOVEMENT_TYPE = 'Option', ASSUMED_DISCOUNT, NULL)), 3)
-                                                         AS avg_discount_on_new_holds
+SELECT column_name, data_type
+FROM ANALYTICS_DEV_CONNOR.INFORMATION_SCHEMA.COLUMNS
+WHERE table_schema = 'SALES' AND table_name = 'SALES_MOVEMENT'
+  AND (column_name ILIKE ANY ('%DATE%', '%_AT', '%DEPART%', '%TIME%', '%START%')
+       OR data_type ILIKE 'TIMESTAMP%' OR data_type = 'DATE')
+ORDER BY ordinal_position;
+
+
+SELECT YEAR(s.ORIGINAL_BOOKINGDATE_LOCAL)      AS yr,
+       f.value::STRING                         AS promo_code,
+       COUNT(DISTINCT s.BOOKING_ID)            AS n_bookings,
+       MIN(s.ORIGINAL_BOOKINGDATE_LOCAL)::DATE AS first_used,
+       MAX(s.ORIGINAL_BOOKINGDATE_LOCAL)::DATE AS last_used
+FROM ANALYTICS_DEV_CONNOR.SALES.SALES_MOVEMENT s,
+     LATERAL FLATTEN(input => s.PROMOTION_CODES) f
+WHERE s.ORIGINAL_BOOKINGDATE_LOCAL BETWEEN '2024-08-01' AND '2025-12-31'
+  AND UPPER(s.DIVISION_BRAND) = 'TOURING'
+  AND s.NET_MOVEMENT_TYPE = 'Option'
+  AND f.value::STRING ILIKE ANY ('BF%', '%BLACK%', '%CYBER%', 'EARLYACCESS%')
+GROUP BY 1, 2
+ORDER BY 1, n_bookings DESC;
+
+
+SELECT DATE_TRUNC('week', ORIGINAL_BOOKINGDATE_LOCAL)::DATE      AS book_week,
+       COALESCE(ARRAY_TO_STRING(PROMOTION_CODES, ','), '(none)') AS promo_codes,
+       COUNT(DISTINCT BOOKING_ID)                                AS n_bookings,
+       SUM(PAX)                                                  AS new_holds,
+       ROUND(SUM(PAX) / COUNT(DISTINCT BOOKING_ID), 1)           AS pax_per_booking
 FROM ANALYTICS_DEV_CONNOR.SALES.SALES_MOVEMENT
-WHERE ORIGINAL_BOOKINGDATE_LOCAL BETWEEN '2024-07-01' AND CURRENT_DATE
+WHERE NET_MOVEMENT_TYPE = 'Option'
+  AND ORIGINAL_BOOKINGDATE_LOCAL >= DATEADD('week', -6, CURRENT_DATE)
   AND UPPER(DIVISION_BRAND) = 'TOURING'
   AND IS_FTC = FALSE
 GROUP BY 1, 2
-ORDER BY 1, 2;
+QUALIFY ROW_NUMBER() OVER (PARTITION BY book_week ORDER BY new_holds DESC) <= 10
+ORDER BY 1, new_holds DESC;
