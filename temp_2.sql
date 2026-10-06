@@ -1,78 +1,149 @@
-WITH rev AS (
+WITH
+sales AS (
   SELECT
-    TOUR_COL::STRING AS tour_id,
-    ANY_VALUE(MAIN_BRAND) AS brand,
-    COUNT(DISTINCT BOOKING_ID) AS bookings,
+    PRODUCT_CODE,
+    LEFT(UPPER(REGEXP_REPLACE(
+      ANY_VALUE(MAIN_BRAND), '[^A-Za-z]', '')), 4)
+      AS brand4,
+    REGEXP_REPLACE(LOWER(
+      ANY_VALUE(PRODUCT_NAME)), '[^a-z0-9]', '')
+      AS key1,
+    REGEXP_REPLACE(LOWER(
+      ANY_VALUE(PRODUCT_STANDARD_NAME)), '[^a-z0-9]', '')
+      AS key2,
     SUM(PAX) AS net_pax,
     SUM(SIGN(PAX) * ABS(COALESCE(
       GROSS_PRICE_USD_2025_RATE, 0)))
       AS net_revenue_usd
   FROM ANALYTICS_DEV_CONNOR.SALES.SALES_MOVEMENT
-  WHERE UPPER(DIVISION_BRAND) = 'TOURING'
+  WHERE DEPARTURE_YEAR = 2025
     AND NOT COALESCE(IS_FTC, FALSE)
     AND NOT COALESCE(IS_BOOKING_QUOTE, FALSE)
-    AND DEPARTURE_YEAR = 2025
-  GROUP BY 1
+  GROUP BY PRODUCT_CODE
 ),
-cov AS (
+feed AS (
   SELECT
-    tour_id,
-    ANY_VALUE(TOUR_NAME) AS tour_name,
-    COUNT(DISTINCT IFF(
-      scrape_date BETWEEN '2025-09-01'
-                      AND '2025-12-31',
-      scrape_date, NULL)) AS scrapes_sepdec25,
-    COUNT(DISTINCT IFF(
-      scrape_date >= '2026-09-01',
-      scrape_date, NULL)) AS scrapes_2026
-  FROM ANALYTICS_DEV_CONNOR.SALES.TMP_TTC_COMP
-  WHERE SITE IN ('Trafalgar', 'Insight',
-                 'CostSaver', 'Contiki')
-  GROUP BY tour_id
-),
-m AS (
-  SELECT
+    SITE,
+    TOUR_NAME,
+    LEFT(UPPER(REGEXP_REPLACE(
+      SITE, '[^A-Za-z]', '')), 4) AS brand4,
+    REGEXP_REPLACE(LOWER(TOUR_NAME),
+      '[^a-z0-9]', '') AS name_key,
     TOUR_ID_CONSOLIDATED::STRING AS tour_id,
-    ANY_VALUE(COMPETITOR_LOW_SITE || ': '
-      || COMPETITOR_LOW_TOUR_NAME) AS comp_low,
-    ANY_VALUE(COMPETITOR_HIGH_SITE || ': '
-      || COMPETITOR_HIGH_TOUR_NAME) AS comp_high
-  FROM ANALYTICS_DEV_CONNOR.REPORTING.REPORTING_ALYTICS_MATCHED_PRODUCTS
-  GROUP BY 1
+    DEPARTURE_DATE::DATE AS departure_date,
+    SCRAPE_DATE::DATE AS scrape_date,
+    CURRENCY,
+    MIN(PRICE) AS price,
+    MIN_BY(PRICE_PD, PRICE) AS price_pd
+  FROM ANALYTICS_DEV_CONNOR.REPORTING.COMPETITOR_RAW
+  WHERE (SCRAPE_DATE BETWEEN '2025-09-01'
+                         AND '2025-12-31'
+         OR SCRAPE_DATE >= '2026-09-01')
+    AND DEPARTURE_DATE > SCRAPE_DATE
+    AND PRICE > 0
+  GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+),
+ttc AS (
+  SELECT
+    brand4,
+    name_key,
+    ANY_VALUE(SITE) AS brand,
+    ANY_VALUE(TOUR_NAME) AS tour_name,
+    COUNT(DISTINCT IFF(scrape_date <= '2025-12-31',
+                       scrape_date, NULL))
+      AS scrapes_2025,
+    COUNT(DISTINCT IFF(scrape_date >= '2026-09-01',
+                       scrape_date, NULL))
+      AS scrapes_2026
+  FROM feed
+  WHERE brand4 IN ('TRAF', 'INSI', 'COST', 'CONT')
+  GROUP BY brand4, name_key
+),
+comp AS (
+  SELECT DISTINCT
+    f.brand4,
+    f.name_key,
+    mp.COMPETITOR_LOW_SITE AS comp_site,
+    mp.COMPETITOR_LOW_TOUR_NAME AS comp_tour
+  FROM (SELECT DISTINCT brand4, name_key, tour_id
+        FROM feed) f
+  JOIN ANALYTICS_DEV_CONNOR.REPORTING.REPORTING_ALYTICS_MATCHED_PRODUCTS mp
+    ON mp.TOUR_ID_CONSOLIDATED::STRING = f.tour_id
+  WHERE mp.COMPETITOR_LOW_SITE IS NOT NULL
+  UNION
+  SELECT DISTINCT
+    f.brand4,
+    f.name_key,
+    mp.COMPETITOR_HIGH_SITE,
+    mp.COMPETITOR_HIGH_TOUR_NAME
+  FROM (SELECT DISTINCT brand4, name_key, tour_id
+        FROM feed) f
+  JOIN ANALYTICS_DEV_CONNOR.REPORTING.REPORTING_ALYTICS_MATCHED_PRODUCTS mp
+    ON mp.TOUR_ID_CONSOLIDATED::STRING = f.tour_id
+  WHERE mp.COMPETITOR_HIGH_SITE IS NOT NULL
+),
+ranked AS (
+  SELECT
+    RANK() OVER (ORDER BY SUM(s.net_revenue_usd) DESC)
+      AS revenue_rank,
+    t.brand,
+    t.tour_name,
+    ROUND(SUM(s.net_revenue_usd))
+      AS net_revenue_usd_2025,
+    SUM(s.net_pax) AS net_pax_2025,
+    t.scrapes_2025,
+    t.scrapes_2026,
+    t.brand4,
+    t.name_key
+  FROM ttc t
+  JOIN sales s
+    ON s.brand4 = t.brand4
+   AND t.name_key IN (s.key1, s.key2)
+  WHERE t.scrapes_2025 >= 8
+    AND EXISTS (SELECT 1 FROM comp c
+                WHERE c.brand4 = t.brand4
+                  AND c.name_key = t.name_key)
+  GROUP BY t.brand, t.tour_name, t.scrapes_2025,
+           t.scrapes_2026, t.brand4, t.name_key
+),
+pick AS (
+  SELECT revenue_rank, brand, tour_name, brand4, name_key
+  FROM ranked
+  WHERE revenue_rank <= 5
+),
+lines AS (
+  SELECT k.revenue_rank, k.brand, k.tour_name AS ttc_tour,
+         'TTC ' || f.SITE AS series_name,
+         f.scrape_date, f.departure_date, f.price_pd, f.CURRENCY
+  FROM feed f
+  JOIN pick k
+    ON f.brand4 = k.brand4
+   AND f.name_key = k.name_key
+  UNION ALL
+  SELECT k.revenue_rank, k.brand, k.tour_name,
+         f.SITE || ': ' || f.TOUR_NAME,
+         f.scrape_date, f.departure_date, f.price_pd, f.CURRENCY
+  FROM feed f
+  JOIN comp c
+    ON f.SITE = c.comp_site
+   AND f.TOUR_NAME = c.comp_tour
+  JOIN pick k
+    ON c.brand4 = k.brand4
+   AND c.name_key = k.name_key
 )
 SELECT
-  RANK() OVER (ORDER BY r.net_revenue_usd DESC)
-    AS revenue_rank,
-  r.tour_id,
-  c.tour_name,
-  r.brand,
-  r.bookings,
-  r.net_pax,
-  ROUND(r.net_revenue_usd) AS net_revenue_usd,
-  ROUND(r.net_revenue_usd
-    / SUM(r.net_revenue_usd) OVER (), 4)
-    AS share_of_revenue,
-  ROUND(SUM(r.net_revenue_usd) OVER (
-          ORDER BY r.net_revenue_usd DESC
-          ROWS UNBOUNDED PRECEDING)
-    / SUM(r.net_revenue_usd) OVER (), 4)
-    AS cumulative_share,
-  m.comp_low,
-  m.comp_high,
-  COALESCE(c.scrapes_sepdec25, 0)
-    AS scrapes_sepdec25,
-  COALESCE(c.scrapes_2026, 0) AS scrapes_2026,
-  CASE
-    WHEN m.tour_id IS NULL
-      THEN 'No: no matched competitor'
-    WHEN COALESCE(c.scrapes_sepdec25, 0) < 12
-      THEN 'No: too few autumn 2025 prices'
-    WHEN COALESCE(c.scrapes_2026, 0) < 3
-      THEN 'No: too few 2026 prices'
-    ELSE 'Yes'
-  END AS chartable
-FROM rev r
-LEFT JOIN cov c ON c.tour_id = r.tour_id
-LEFT JOIN m ON m.tour_id = r.tour_id
-ORDER BY revenue_rank
-LIMIT 50;
+  revenue_rank || '. ' || brand || ' ' || ttc_tour AS tour,
+  IFF(YEAR(scrape_date) = 2025,
+      'Sep-Dec 2025', 'Sep 2026 to now') AS period,
+  'Wk ' || LPAD((FLOOR(DATEDIFF('day',
+      DATE_FROM_PARTS(YEAR(scrape_date), 9, 1),
+      scrape_date) / 7) + 1)::INT::STRING, 2, '0')
+    || ' (' || TO_CHAR(scrape_date, 'DD Mon') || ')' AS week,
+  series_name,
+  ROUND(MEDIAN(price_pd), 1) AS price_per_day,
+  COUNT(*) AS departures_priced
+FROM lines
+WHERE CURRENCY = 'USD'
+  AND YEAR(departure_date) = YEAR(scrape_date) + 1
+GROUP BY 1, 2, 3, 4
+ORDER BY 1, 2, 3, 4;
